@@ -41,12 +41,8 @@ public class HzModule extends XposedModule {
     private final Map<Object, Long> tokenPhys = Collections.synchronizedMap(new WeakHashMap<>());
     /** 每个调用者最近一条日志，去重用 */
     private final Map<String, String> callerNotes = Collections.synchronizedMap(new HashMap<>());
-    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener = (sp, key) -> {
-        L(Log.INFO, "config changed: enabled=" + sp.getBoolean(Cfg.ENABLED, false)
-                + " target=" + sp.getInt(Cfg.TARGET, 0)
-                + " mode=" + (sp.getInt(Cfg.MODE, Cfg.MODE_LOCK) == Cfg.MODE_LOCK ? "lock" : "peak"));
-        scheduleReapply();
-    };
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener =
+            (sp, key) -> scheduleReapply();
 
     public HzModule() {
         super();
@@ -154,17 +150,24 @@ public class HzModule extends XposedModule {
                 if (!m.getName().equals("setDesiredDisplayModeSpecs") || m.getParameterCount() != 2) continue;
                 hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                     Object token = chain.getArg(0);
-                    Object spec = chain.getArg(1);
-                    if (token == null || spec == null) return chain.proceed();
-                    Object patched = null;
-                    try {
-                        patched = patchSc(token, spec);
-                    } catch (Throwable t) {
-                        L(Log.ERROR, "sc patch failed", t);
+                    Object arg = chain.getArg(1);
+                    if (token == null || arg == null) return chain.proceed();
+                    String caller = caller();
+                    // Android 17 / ColorOS 这里传的是 DesiredDisplayModeSpecs[]，逐个改
+                    if (arg instanceof Object[]) {
+                        Object[] in = (Object[]) arg;
+                        Object[] out = (Object[]) java.lang.reflect.Array.newInstance(
+                                in.getClass().getComponentType(), in.length);
+                        boolean changed = false;
+                        for (int i = 0; i < in.length; i++) {
+                            Object pt = safePatchSc(token, in[i], caller, "[" + i + "/" + in.length + "]");
+                            out[i] = pt != null ? pt : in[i];
+                            changed |= pt != null;
+                        }
+                        return changed ? chain.proceed(new Object[]{token, out}) : chain.proceed();
                     }
-                    return patched != null
-                            ? chain.proceed(new Object[]{token, patched})
-                            : chain.proceed();
+                    Object pt = safePatchSc(token, arg, caller, "");
+                    return pt != null ? chain.proceed(new Object[]{token, pt}) : chain.proceed();
                 });
                 n++;
             }
@@ -183,8 +186,27 @@ public class HzModule extends XposedModule {
         }
     }
 
-    private Object patchSc(Object token, Object spec) throws Throwable {
-        String caller = caller();
+    private volatile boolean specShapeLogged;
+
+    private Object safePatchSc(Object token, Object spec, String caller, String idx) {
+        if (spec == null) return null;
+        try {
+            return patchSc(token, spec, caller, idx);
+        } catch (Throwable t) {
+            if (!specShapeLogged) { // 结构不认识时，把字段表打出来，下次照着改
+                specShapeLogged = true;
+                StringBuilder sb = new StringBuilder("spec class " + spec.getClass().getName() + " fields:");
+                for (Class<?> k = spec.getClass(); k != null && k != Object.class; k = k.getSuperclass())
+                    for (Field f : k.getDeclaredFields()) sb.append(' ').append(f.getType().getSimpleName()).append(' ').append(f.getName()).append(';');
+                L(Log.WARN, sb.toString());
+                L(Log.ERROR, "sc patch failed", t);
+            }
+            return null;
+        }
+    }
+
+    private Object patchSc(Object token, Object spec, String caller, String idx) throws Throwable {
+        caller = idx + " " + caller;
         String in = "mode " + field(spec.getClass(), "defaultMode").getInt(spec) + " "
                 + rangeStr(field(spec.getClass(), "primaryRanges").get(spec));
 
@@ -198,6 +220,11 @@ public class HzModule extends XposedModule {
         boolean lock = p.getInt(Cfg.MODE, Cfg.MODE_LOCK) == Cfg.MODE_LOCK;
 
         Long pid = tokenPhys.get(token);
+        if (pid == null && tokenPhys.size() == 1) {
+            synchronized (tokenPhys) {
+                pid = tokenPhys.values().iterator().next();
+            }
+        }
         if (pid == null) {
             noteCaller(caller, "unknown display token, from " + caller);
             return null;
@@ -265,11 +292,16 @@ public class HzModule extends XposedModule {
     private static String caller() {
         StringBuilder sb = new StringBuilder();
         int taken = 0;
+        boolean pastStub = false;
         for (StackTraceElement e : new Throwable().getStackTrace()) {
             String c = e.getClassName();
-            if (c.startsWith("android.view.SurfaceControl") || c.startsWith("io.github.hzctl")
-                    || c.startsWith("java.lang.reflect") || c.contains("xposed") || c.contains("lsposed")
-                    || c.contains("LSPHooker") || c.startsWith("dalvik.") || c.startsWith("java.lang.Thread"))
+            // 先跳过本模块和 LSPosed 的调用链，直到被 hook 的 setDesiredDisplayModeSpecs 本身
+            if (!pastStub) {
+                if (e.getMethodName().equals("setDesiredDisplayModeSpecs")) pastStub = true;
+                continue;
+            }
+            if (c.startsWith("android.os.") || c.contains("ExternalSyntheticLambda") || c.contains("PooledLambda")
+                    || c.contains("OmniFunction"))
                 continue;
             if (taken > 0) sb.append(" <- ");
             sb.append(c.substring(c.lastIndexOf('.') + 1)).append('.').append(e.getMethodName());
@@ -403,6 +435,12 @@ public class HzModule extends XposedModule {
     }
 
     private void reapply() {
+        SharedPreferences sp = prefs;
+        if (sp != null) {
+            L(Log.INFO, "config changed: enabled=" + sp.getBoolean(Cfg.ENABLED, false)
+                    + " target=" + sp.getInt(Cfg.TARGET, 0)
+                    + " mode=" + (sp.getInt(Cfg.MODE, Cfg.MODE_LOCK) == Cfg.MODE_LOCK ? "lock" : "peak"));
+        }
         Method m = setSpecs;
         if (m == null) return;
         Map<Object, Object> snap;
