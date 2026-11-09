@@ -37,11 +37,73 @@ public class HzModule extends XposedModule {
     private volatile SharedPreferences prefs;
     private Handler bg;
     private volatile String lastNote = "";
-    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener =
-            (sp, key) -> scheduleReapply();
+    /** displayToken -> 物理屏 id，用来在 SurfaceControl 层查 SF 的模式表 */
+    private final Map<Object, Long> tokenPhys = Collections.synchronizedMap(new WeakHashMap<>());
+    /** 每个调用者最近一条日志，去重用 */
+    private final Map<String, String> callerNotes = Collections.synchronizedMap(new HashMap<>());
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener = (sp, key) -> {
+        L(Log.INFO, "config changed: enabled=" + sp.getBoolean(Cfg.ENABLED, false)
+                + " target=" + sp.getInt(Cfg.TARGET, 0)
+                + " mode=" + (sp.getInt(Cfg.MODE, Cfg.MODE_LOCK) == Cfg.MODE_LOCK ? "lock" : "peak"));
+        scheduleReapply();
+    };
 
     public HzModule() {
         super();
+    }
+
+    // ---------------- 日志：LSPosed 日志 + /data/system/hzctl/hzctl.log（App 用 root 读） ----------------
+
+    static final String LOG_FILE = Cfg.LOG_FILE;
+    private static final long LOG_MAX = 256 * 1024;
+    private static Handler logH;
+    private static final java.text.SimpleDateFormat TS =
+            new java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US);
+
+    void L(int prio, String msg) {
+        L(prio, msg, null);
+    }
+
+    void L(int prio, String msg, Throwable t) {
+        try {
+            if (t == null) log(prio, TAG, msg);
+            else log(prio, TAG, msg, t);
+        } catch (Throwable ignored) {
+        }
+        String lvl = prio >= Log.ERROR ? "E" : prio == Log.WARN ? "W" : "I";
+        StringBuilder line = new StringBuilder();
+        synchronized (TS) {
+            line.append(TS.format(new java.util.Date()));
+        }
+        line.append(' ').append(lvl).append(' ').append(msg).append('\n');
+        if (t != null) line.append(Log.getStackTraceString(t)).append('\n');
+        fileAppend(line.toString());
+    }
+
+    private static synchronized void fileAppend(String text) {
+        if (logH == null) {
+            HandlerThread th = new HandlerThread("HzCtlLog");
+            th.start();
+            logH = new Handler(th.getLooper());
+        }
+        logH.post(() -> {
+            try {
+                java.io.File f = new java.io.File(LOG_FILE);
+                java.io.File dir = f.getParentFile();
+                if (dir != null && !dir.exists()) dir.mkdirs();
+                if (f.length() > LOG_MAX) { // 超过上限只保留后一半
+                    byte[] all = java.nio.file.Files.readAllBytes(f.toPath());
+                    int from = all.length / 2;
+                    while (from < all.length && all[from] != '\n') from++;
+                    java.nio.file.Files.write(f.toPath(),
+                            java.util.Arrays.copyOfRange(all, Math.min(from + 1, all.length), all.length));
+                }
+                try (java.io.FileWriter w = new java.io.FileWriter(f, true)) {
+                    w.write(text);
+                }
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     @Override
@@ -59,20 +121,167 @@ public class HzModule extends XposedModule {
                     Object spec = chain.getArg(0);
                     if (self == null || spec == null) return chain.proceed();
                     lastSpecs.put(self, spec);
+                    rememberToken(self);
                     Object patched = null;
                     try {
                         patched = patch(self, spec);
                     } catch (Throwable t) {
-                        log(Log.ERROR, TAG, "patch failed", t);
+                        L(Log.ERROR, "patch failed", t);
                     }
                     return patched != null ? chain.proceed(new Object[]{patched}) : chain.proceed();
                 });
                 n++;
             }
-            log(Log.INFO, TAG, "hooked " + n + " method(s)");
+            n += hookSurfaceControl();
+            L(Log.INFO, "======== system_server start, HzCtl " + BuildConfigLite.VERSION
+                    + ", " + android.os.Build.MODEL + " / " + android.os.Build.DISPLAY
+                    + ", SDK " + android.os.Build.VERSION.SDK_INT + " ========");
+            L(Log.INFO, "hooked " + n + " method(s)");
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "init failed", t);
+            L(Log.ERROR, "init failed", t);
         }
+    }
+
+    /**
+     * 第二道：SurfaceControl.setDesiredDisplayModeSpecs 是 Java 层交给 SurfaceFlinger 的最后一步。
+     * ColorOS 有自己的代码绕过 DisplayModeDirector 直接调它，把策略压成 [120,120]，
+     * 所以这里不管谁调，都按配置改写，并把调用者记进日志。
+     */
+    private int hookSurfaceControl() {
+        int n = 0;
+        try {
+            for (Method m : Class.forName("android.view.SurfaceControl").getDeclaredMethods()) {
+                if (!m.getName().equals("setDesiredDisplayModeSpecs") || m.getParameterCount() != 2) continue;
+                hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                    Object token = chain.getArg(0);
+                    Object spec = chain.getArg(1);
+                    if (token == null || spec == null) return chain.proceed();
+                    Object patched = null;
+                    try {
+                        patched = patchSc(token, spec);
+                    } catch (Throwable t) {
+                        L(Log.ERROR, "sc patch failed", t);
+                    }
+                    return patched != null
+                            ? chain.proceed(new Object[]{token, patched})
+                            : chain.proceed();
+                });
+                n++;
+            }
+        } catch (Throwable t) {
+            L(Log.ERROR, "SurfaceControl hook failed", t);
+        }
+        return n;
+    }
+
+    private void rememberToken(Object dev) {
+        try {
+            Object tok = method(dev.getClass(), "getDisplayTokenLocked").invoke(dev);
+            long pid = field(dev.getClass(), "mPhysicalDisplayId").getLong(dev);
+            if (tok != null) tokenPhys.put(tok, pid);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private Object patchSc(Object token, Object spec) throws Throwable {
+        String caller = caller();
+        String in = "mode " + field(spec.getClass(), "defaultMode").getInt(spec) + " "
+                + rangeStr(field(spec.getClass(), "primaryRanges").get(spec));
+
+        SharedPreferences p = prefs();
+        if (p == null || !p.getBoolean(Cfg.ENABLED, false)) {
+            noteCaller(caller, "SF <- " + in + " (off) from " + caller);
+            return null;
+        }
+        int target = p.getInt(Cfg.TARGET, 0);
+        if (target <= 0) return null;
+        boolean lock = p.getInt(Cfg.MODE, Cfg.MODE_LOCK) == Cfg.MODE_LOCK;
+
+        Long pid = tokenPhys.get(token);
+        if (pid == null) {
+            noteCaller(caller, "unknown display token, from " + caller);
+            return null;
+        }
+        Class<?> sc = Class.forName("android.view.SurfaceControl");
+        Object dyn = method(sc, "getDynamicDisplayInfo").invoke(null, pid);
+        Object[] modes = (Object[]) field(dyn.getClass(), "supportedDisplayModes").get(dyn);
+        int curId = field(spec.getClass(), "defaultMode").getInt(spec);
+
+        Object cur = null;
+        for (Object m : modes) if (field(m.getClass(), "id").getInt(m) == curId) cur = m;
+        Object best = pickSc(modes, cur, target);
+        if (best == null && cur != null) best = pickSc(modes, null, target);
+        if (best == null) {
+            noteCaller(caller, "SF has no " + target + "Hz mode");
+            return null;
+        }
+        float hz = scRate(best);
+        Object out = copy(spec);
+        field(out.getClass(), "defaultMode").setInt(out, field(best.getClass(), "id").getInt(best));
+        retarget(out, "primaryRanges", hz, lock);
+        retarget(out, "appRequestRanges", hz, lock);
+        noteCaller(caller, "SF <- " + in + " from " + caller + "  => rewritten to sfMode "
+                + field(best.getClass(), "id").getInt(best) + " " + rangeStr(field(out.getClass(), "primaryRanges").get(out)));
+        return out;
+    }
+
+    private static Object pickSc(Object[] modes, Object cur, int target) throws Throwable {
+        Object best = null;
+        float bestDiff = Float.MAX_VALUE;
+        for (Object m : modes) {
+            if (cur != null && (field(m.getClass(), "width").getInt(m) != field(cur.getClass(), "width").getInt(cur)
+                    || field(m.getClass(), "height").getInt(m) != field(cur.getClass(), "height").getInt(cur))) continue;
+            float d = Math.abs(scRate(m) - target);
+            if (d < bestDiff) {
+                bestDiff = d;
+                best = m;
+            }
+        }
+        return bestDiff <= 1.5f ? best : null;
+    }
+
+    private static float scRate(Object mode) throws Throwable {
+        for (String n : new String[]{"peakRefreshRate", "refreshRate", "vsyncRate"}) {
+            try {
+                return field(mode.getClass(), n).getFloat(mode);
+            } catch (NoSuchFieldException ignored) {
+            }
+        }
+        throw new NoSuchFieldException("refresh rate of " + mode.getClass().getName());
+    }
+
+    private static String rangeStr(Object ranges) {
+        try {
+            Object ph = field(ranges.getClass(), "physical").get(ranges);
+            Object re = field(ranges.getClass(), "render").get(ranges);
+            return "phys[" + field(ph.getClass(), "min").getFloat(ph) + "," + field(ph.getClass(), "max").getFloat(ph)
+                    + "] render[" + field(re.getClass(), "min").getFloat(re) + "," + field(re.getClass(), "max").getFloat(re) + "]";
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 调用栈里第一个不属于 SurfaceControl / 本模块 / hook 框架的帧，就是真正的调用者 */
+    private static String caller() {
+        StringBuilder sb = new StringBuilder();
+        int taken = 0;
+        for (StackTraceElement e : new Throwable().getStackTrace()) {
+            String c = e.getClassName();
+            if (c.startsWith("android.view.SurfaceControl") || c.startsWith("io.github.hzctl")
+                    || c.startsWith("java.lang.reflect") || c.contains("xposed") || c.contains("lsposed")
+                    || c.contains("LSPHooker") || c.startsWith("dalvik.") || c.startsWith("java.lang.Thread"))
+                continue;
+            if (taken > 0) sb.append(" <- ");
+            sb.append(c.substring(c.lastIndexOf('.') + 1)).append('.').append(e.getMethodName());
+            if (++taken == 5) break;
+        }
+        return sb.length() == 0 ? "?" : sb.toString();
+    }
+
+    private void noteCaller(String caller, String msg) {
+        if (msg.equals(callerNotes.get(caller))) return;
+        callerNotes.put(caller, msg);
+        L(Log.INFO, msg);
     }
 
     // ---------------- 改写 ----------------
@@ -109,8 +318,10 @@ public class HzModule extends XposedModule {
         field(out.getClass(), "baseModeId").setInt(out, best.getModeId());
         retarget(out, "primary", hz, lock);
         retarget(out, "appRequest", hz, lock);
-        note((lock ? "lock " : "peak ") + hz + "Hz -> mode #" + best.getModeId()
+        note("DMD <- base #" + baseId + " " + rangeStr(field(spec.getClass(), "primary").get(spec))
+                + "  => " + (lock ? "lock " : "peak ") + hz + "Hz mode #" + best.getModeId()
                 + " " + best.getPhysicalWidth() + "x" + best.getPhysicalHeight());
+        noteModes(modes);
         return out;
     }
 
@@ -174,7 +385,7 @@ public class HzModule extends XposedModule {
                     sp.registerOnSharedPreferenceChangeListener(prefListener);
                     prefs = sp;
                 } catch (Throwable t) {
-                    log(Log.WARN, TAG, "remote prefs not ready: " + t);
+                    L(Log.WARN, "remote prefs not ready: " + t);
                 }
             }
             return prefs;
@@ -202,7 +413,7 @@ public class HzModule extends XposedModule {
             try {
                 Object lock = syncRoot(e.getKey());
                 if (lock == null) {
-                    log(Log.WARN, TAG, "no sync root, change applies on next mode update");
+                    L(Log.WARN, "no sync root, change applies on next mode update");
                     continue;
                 }
                 // 走反射调用同样会经过上面的 hook，由它负责改写
@@ -210,7 +421,7 @@ public class HzModule extends XposedModule {
                     m.invoke(e.getKey(), e.getValue());
                 }
             } catch (Throwable t) {
-                log(Log.ERROR, TAG, "reapply failed", t);
+                L(Log.ERROR, "reapply failed", t);
             }
         }
     }
@@ -237,10 +448,18 @@ public class HzModule extends XposedModule {
 
     // ---------------- 小工具 ----------------
 
+    private volatile boolean modesLogged;
+
+    private void noteModes(Display.Mode[] modes) {
+        if (modesLogged) return;
+        modesLogged = true;
+        L(Log.INFO, "panel modes: " + describe(modes));
+    }
+
     private void note(String msg) {
         if (msg.equals(lastNote)) return;
         lastNote = msg;
-        log(Log.INFO, TAG, msg);
+        L(Log.INFO, msg);
     }
 
     private static String describe(Display.Mode[] modes) {

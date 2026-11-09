@@ -20,6 +20,8 @@
 
 ## 运行时排查
 LSPosed 日志搜 `HzCtl`：
-- `hooked 1 method(s)`：挂上了
+- `hooked 2 method(s)`：两道都挂上了（1 说明 SurfaceControl 那道没找到）
 - `lock 165.0Hz -> mode #N ...`：已改写下发
 - `no 165Hz mode, panel offers: ...`：屏幕驱动没报 165 的模式，把这行完整发回来
+- `SF <- mode X phys[...] from <调用者>  => rewritten ...`：第二道拦截生效，<调用者> 就是往 SurfaceFlinger 下发策略的代码
+- 打开后若 `dumpsys SurfaceFlinger` 的 displayManagerPolicy 仍是 [120,120]，且日志里没有新的调用者，说明 ColorOS 在 native 层改的

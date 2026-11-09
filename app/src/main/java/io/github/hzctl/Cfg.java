@@ -8,6 +8,8 @@ final class Cfg {
     static final String MODE = "mode";         // int 见下
     static final int MODE_LOCK = 0;            // 锁定：最低 = 最高 = 目标
     static final int MODE_PEAK = 1;            // 上限：最高 = 目标，允许系统降频
+    /** 模块在 system_server 里写的日志，App 通过 root 读取 */
+    static final String LOG_FILE = "/data/system/hzctl/hzctl.log";
 
     private Cfg() {}
 }

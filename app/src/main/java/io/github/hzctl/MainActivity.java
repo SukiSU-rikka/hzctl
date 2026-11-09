@@ -86,6 +86,7 @@ public class MainActivity extends AppCompatActivity {
         swPass = findViewById(R.id.swPass);
         swSf = findViewById(R.id.swSf);
 
+        findViewById(R.id.btnLog).setOnClickListener(v -> startActivity(new Intent(this, LogActivity.class)));
         buildChips();
         wireControls();
         wireDisplay();
