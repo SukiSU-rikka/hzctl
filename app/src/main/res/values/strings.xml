@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">刷新率调节</string>
+    <string name="desc">解锁并锁定系统刷新率（如 165Hz），附带刷新率悬浮窗</string>
+</resources>

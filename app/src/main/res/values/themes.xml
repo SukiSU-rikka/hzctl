@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.HzCtl" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- 没有莫奈取色时的兜底：深海青 -->
+        <item name="colorPrimary">#00696B</item>
+        <item name="colorPrimaryContainer">#9CF1F1</item>
+        <item name="colorOnPrimaryContainer">#002020</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>
