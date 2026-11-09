@@ -11,9 +11,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
-      - name: Install Android 17 platform
-        run: sdkmanager "platforms;android-37" || sdkmanager "platforms;android-37.0"
+      - run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.2"'
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.13"
